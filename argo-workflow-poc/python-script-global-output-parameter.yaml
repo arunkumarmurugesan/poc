@@ -1,0 +1,142 @@
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: clean-unused-volumes
+spec:
+  schedule: "15 2 * * *"
+  concurrencyPolicy: "Replace"
+  startingDeadlineSeconds: 0
+  workflowMetadata:
+    labels: 
+      role: clean-unused-volumes
+  workflowSpec:
+    arguments:
+      parameters:
+      - name: SLACK_WEBHOOK
+        value: "https://hooks.slack.com/services/xxx/xxxxx/xxx"
+      - name: SLACK_CHANNEL
+        value: "arun-testing-poc"
+    entrypoint: clean-unused-volumes
+    onExit: exit-handler
+    templates:
+    - name: clean-unused-volumes
+      steps:
+      - - name: execute-script
+          template: execute-script
+      - - name: trim-output
+          template: trim-output
+          arguments:
+            parameters:
+            - name: message
+              value: "{{steps.execute-script.outputs.result}}"
+      - - name: global-output
+          template: global-output
+          arguments:
+            parameters:
+            - name: message
+              value: "{{steps.trim-output.outputs.result}}"
+
+    - name: execute-script
+      inputs:
+        artifacts:
+        - git:
+            repo: git@github.com:arunkumarmurugesan/poc.git
+            sshPrivateKeySecret:
+              name: github-ssh-auth
+              key: ssh-privatekey
+          name: terraform
+          path: /terraform
+          singleBranch: true
+          branch: TOBSSRE-2882
+      retryStrategy:
+        limit: 3
+      container:
+        image: 123456789.dkr.ecr.us-west-2.amazonaws.com/driftctl/infra-drift:python3
+        command: [sh, -c]
+        args:
+        - |
+          pip install boto3
+          cd /terraform/JenkinsScripts
+          python delete-unused-volumes.py
+
+    - name: trim-output
+      inputs:
+        parameters:
+        - name: message
+      script:
+        image: debian:9.4
+        command: [bash]
+        source: |
+          echo "{{inputs.parameters.message}}" | tail -n 1
+
+    # Template which produces a global parameter and artifact
+    - name: global-output
+      inputs:
+        parameters:
+        - name: message
+      container:
+        image: alpine:3.7
+        command: [sh, -c]
+        args: ["sleep 1; echo {{inputs.parameters.message}} > /tmp/hello_world.txt"]
+      outputs:
+        parameters:
+        # export a global parameter. The parameter will be programatically available in the completed
+        # workflow object under: workflow.outputs.parameters
+        - name: hello-param
+          valueFrom:
+            path: /tmp/hello_world.txt
+          globalName: my-global-param
+
+    - name: consume-global-param
+      inputs:
+        parameters:
+          - name: param
+            value: "{{workflow.outputs.parameters.my-global-param}}"
+      container:
+        image: alpine:3.7
+        command: [sh, -c]
+        args: ["echo {{inputs.parameters.param}}"]
+
+    - name: exit-handler
+      steps:
+      - - name: consume-global-param
+          template: consume-global-param
+
+      - - name: notify-slack-success
+          template: notify-slack
+          arguments:
+            parameters:
+              - name: message 
+                value: "`{{ steps.consume-global-param.outputs.result }}`, Successfully deleted all the unused volumes.  http://example.com/workflows/default/{{workflow.name}}"
+              - name: color
+                value: good
+          when: "{{workflow.status}} == Succeeded"    
+      - - name: notify-slack-failure
+          template: notify-slack
+          arguments:
+            parameters:
+              - name: message 
+                value: "Unused volume deletion workflow is failed http://example.com/workflows/default/{{workflow.name}} please check"
+              - name: color
+                value: danger    
+          when: "{{workflow.status}} in (Failed, Error)"
+          
+    - name: notify-slack
+      inputs:
+        parameters:
+        - name: message
+        - name: color
+          default: good
+        - name: slack-channel
+          default: "{{workflow.parameters.SLACK_CHANNEL}}"
+      container:
+        image: 123456789.dkr.ecr.us-west-2.amazonaws.com/slack-notify
+        env:
+          - name: SLACK_WEBHOOK
+            value: "{{workflow.parameters.SLACK_WEBHOOK}}"
+          - name: SLACK_MESSAGE
+            value: "{{inputs.parameters.message}}"
+          - name: SLACK_COLOR
+            value: "{{inputs.parameters.color}}"
+          - name: SLACK_CHANNEL
+            value: "{{workflow.parameters.SLACK_CHANNEL}}"
